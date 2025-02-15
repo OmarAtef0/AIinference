@@ -1,0 +1,243 @@
+import os
+import warnings
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+warnings.filterwarnings("ignore")
+
+import SimpleITK as sitk
+import nibabel as nib
+from nibabel.orientations import aff2axcodes
+from monai.data import DataLoader, decollate_batch, CacheDataset
+from monai.networks.nets import UNet
+from monai.networks.layers import Norm
+import torch
+from monai.inferers import sliding_window_inference
+import pydicom
+import pydicom_seg
+from monai.transforms import (
+    EnsureChannelFirstd,
+    Compose,
+    CropForegroundd,
+    LoadImaged,
+    Orientationd,
+    ScaleIntensityRanged,
+    Spacingd,
+    Invertd,
+    AsDiscreted,
+    SaveImaged,
+)
+import argparse
+import shutil
+
+
+
+def convert_dicom_to_nifti(dicom_folder, output_dir):
+    """
+    Converts a DICOM series to a NIfTI file and returns its orientation.
+
+    Parameters:
+        dicom_folder (str): Path to the folder containing DICOM series.
+        output_dir (str): Directory to save the converted NIfTI file.
+
+    Returns:
+        tuple: (output_nifti_path, orientation_code)
+    """
+    # Create output filename based on folder name
+    output_filename = os.path.basename(os.path.normpath(dicom_folder)) + ".nii.gz"
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Read DICOM series
+    reader = sitk.ImageSeriesReader()
+    dicom_series = reader.GetGDCMSeriesFileNames(dicom_folder)
+
+    if not dicom_series:
+        raise ValueError(f"No DICOM files found in {dicom_folder}")
+
+    reader.SetFileNames(dicom_series)
+    image = reader.Execute()
+
+    # Save NIfTI file
+    sitk.WriteImage(image, output_path)
+
+    # Load saved NIfTI file with nibabel
+    nii_img = nib.load(output_path)
+
+    # Get affine transformation matrix
+    affine_matrix = nii_img.affine
+
+    # Get orientation (RAS, LAS, etc.)
+    orientation = aff2axcodes(affine_matrix)
+    orientation = "".join(orientation)
+    return output_path, orientation
+
+test_transforms = Compose(
+    [
+        LoadImaged(keys="image"),
+        EnsureChannelFirstd(keys="image"),
+        Orientationd(keys=["image"], axcodes="RAS"),
+        Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"),
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=-57,
+            a_max=164,
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        ),
+        CropForegroundd(keys=["image"], source_key="image"),
+    ]
+)
+
+def post_processing(dataset, orientation):
+    post_transforms = Compose(
+        [
+            Invertd(
+                keys="pred",
+                transform=test_transforms,
+                orig_keys="image",
+                meta_keys="pred_meta_dict",
+                orig_meta_keys="image_meta_dict",
+                meta_key_postfix="meta_dict",
+                nearest_interp=False,
+                to_tensor=True,
+            ),
+            AsDiscreted(keys="pred", argmax=True, to_onehot=2),
+
+            Orientationd(keys=["pred"], axcodes=orientation),  #ensure the mask is the same orientation as the image
+
+            SaveImaged(keys="pred", meta_keys="pred_meta_dict", output_dir="temp", output_postfix="seg", resample=False),
+        ]
+    )
+    return [post_transforms(i) for i in decollate_batch(dataset)]
+
+def init_model(weights_path):
+    # standard PyTorch program style: create UNet, DiceLoss and Adam optimizer
+    device = torch.device("cuda:0")
+    model = UNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+        norm=Norm.BATCH,
+    ).to(device)
+    model.load_state_dict(torch.load(weights_path))
+    return model, device
+
+def init_writer(json_path):
+    template = pydicom_seg.template.from_dcmqi_metainfo(json_path)
+    writer = pydicom_seg.MultiClassWriter(
+        template=template,
+        inplane_cropping=False,  # Crop image slices to the minimum bounding box on
+                                # x and y axes
+        skip_empty_slices=False,  # Don't encode slices with only zeros
+        skip_missing_segment=False,  # If a segment definition is missing in the
+                                    # template, then raise an error instead of
+                                    # skipping it.
+    )
+    return writer
+
+def load_data(nii_path):
+    try:
+        data_nii = [{"image": nii_path}]
+        test_ds = CacheDataset(data=data_nii, transform=test_transforms)
+        test_loader = DataLoader(test_ds, batch_size=1, num_workers=4)
+        print("Dataloader and dataset done")
+        return test_loader
+    except Exception as e:
+        print(f"Error creating dataset and dataloader: {e}")
+        return
+    
+
+def infere(input_path, output_path, weights_path, json_path):
+    try:
+        nii_path, orientation = convert_dicom_to_nifti(input_path, "temp")
+        print("Data converted to NIfTI")
+    except Exception as e:
+        print(f"Error converting to NIfTI: {e}")
+        return
+
+    test_loader = load_data(nii_path)
+
+    try:
+        model, device = init_model(weights_path)
+        model.eval()
+        print("model init done")
+    except Exception as e:
+        print(f"Error initializing model: {e}")
+        return
+
+    try:
+        with torch.no_grad():
+            for test_data in (test_loader):
+                test_input = test_data["image"].to(device)
+                roi_size = (160, 160, 160)
+                sw_batch_size = 4
+                test_data["pred"] = sliding_window_inference(test_input, roi_size, sw_batch_size, model)
+                test_data = post_processing(test_data, orientation)
+            
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        return
+
+    try:
+        if not test_data:
+            raise ValueError("test_data is None or empty before processing model output")
+        model_output = test_data[0]["pred"].detach().cpu()[1].permute(2, 0, 1)  # 2D channel dimensions for mask
+        print("model output is done successfully")
+    except Exception as e:
+        print(f"Error processing model output: {e}")
+        return
+
+    try:
+        writer = init_writer(json_path)
+        print("writer initialized")
+    except Exception as e:
+        print(f"Error initializing writer: {e}")
+        return
+
+    try:
+        reader = sitk.ImageSeriesReader()
+        dcm_files = reader.GetGDCMSeriesFileNames(input_path)
+        reader.SetFileNames(dcm_files)
+        image = reader.Execute()
+        print("Dicom tags retrived")
+    except Exception as e:
+        print(f"Error reading DICOM files: {e}")
+        return
+
+    try:
+        seg = sitk.GetImageFromArray(model_output)
+        seg.CopyInformation(image)
+        source_images = [pydicom.dcmread(x, stop_before_pixels=True) for x in dcm_files]
+        seg = sitk.Cast(seg, sitk.sitkUInt8)
+        dcm = writer.write(seg, source_images)
+        dcm.save_as(output_path)
+        print(f"Inference completed and saved successfully at '{output_path}' ")
+    except Exception as e:
+        print(f"Error saving output: {e}")
+        return
+    
+    try:
+        if os.path.exists("temp"):
+            shutil.rmtree("temp")
+            print("temp directory removed successfully")
+    except Exception as e:
+        print(f"Error deleting temp: {e}")
+        return
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_path", type=str, help="Input DICOM folder path")
+    parser.add_argument("output_path", type=str, help="Output DICOM file path")
+    parser.add_argument("weight_path", type=str, help="Path to model weights")
+    parser.add_argument("json_path", type=str, help="Path to JSON configuration")
+    args = parser.parse_args()
+    input_path,output_path,weight_path,json_path  = args.input_path, args.output_path, args.weight_path, args.json_path
+    try:
+        infere(input_path,output_path,weight_path,json_path)
+    except Exception as e:
+        print(f"Critical error: {e}")
